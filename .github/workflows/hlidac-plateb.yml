@@ -1,0 +1,60 @@
+# Hlídač platebního serveru ARCHE (2026-10-12, Honza: „ať nežere tokeny").
+# Běží na GitHubu, ne na Macu — když Mac padne, hlídač o tom ví. Žádný model, jen HTTP dotaz.
+# Zpráva na Slack jen při ZMĚNĚ stavu (spadl / zase běží), ne každých 5 minut.
+# Nasazuje se do samostatného veřejného repa (neomezené minuty Actions), zdroj je v AIOS apps/hlidac-plateb.
+name: Hlídač plateb
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # GitHub běh občas o pár minut zpozdí, to nevadí
+  workflow_dispatch:
+
+permissions:
+  actions: read
+
+jobs:
+  kontrola:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Předchozí stav
+        id: predtim
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # závěr posledního dokončeného běhu: success = běželo, failure = byl výpadek
+          stav=$(gh run list -R "$GITHUB_REPOSITORY" --workflow hlidac-plateb.yml --status completed \
+                   --limit 1 --json conclusion -q '.[0].conclusion' 2>/dev/null || true)
+          echo "stav=${stav:-success}" >> "$GITHUB_OUTPUT"
+
+      - name: Kontrola platebního serveru
+        id: kontrola
+        run: |
+          # 3 pokusy po 20 s, ať jeden zaškobrtnutý dotaz nespustí poplach
+          for i in 1 2 3; do
+            odpoved=$(curl -s --max-time 15 -H "ngrok-skip-browser-warning: 1" \
+                      https://archefashion.com/apps/platba/api/stav/hlidac || true)
+            if echo "$odpoved" | grep -q '"stav"'; then echo "Server běží."; exit 0; fi
+            sleep 20
+          done
+          echo "Server neodpovídá. Poslední odpověď: ${odpoved:0:120}"
+          exit 1
+
+      - name: Zpráva na Slack při změně
+        if: always()
+        env:
+          SLACK: ${{ secrets.SLACK_WEBHOOK }}
+          PREDTIM: ${{ steps.predtim.outputs.stav }}
+          TED: ${{ steps.kontrola.outcome }}
+        run: |
+          zprava=""
+          if [ "$TED" = "failure" ] && [ "$PREDTIM" = "success" ]; then
+            zprava=":rotating_light: Platební server ARCHE neodpovídá (/apps/platba). Webová pokladna jede přes Shopify, karta GoPay a vlastní dobírka stojí. Zkontrolujte Mac Mini (proud, internet, přihlášení)."
+          elif [ "$TED" = "success" ] && [ "$PREDTIM" = "failure" ]; then
+            zprava=":white_check_mark: Platební server ARCHE zase běží."
+          fi
+          if [ -n "$zprava" ] && [ -n "$SLACK" ]; then
+            curl -s -X POST -H 'Content-Type: application/json' \
+              --data "{\"text\": \"$zprava\"}" "$SLACK" > /dev/null
+            echo "Odesláno: $zprava"
+          fi
